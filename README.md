@@ -1,12 +1,14 @@
 # guide-assignment-metrics
 
 Evaluation module for the [guide-assignment](https://github.com/tmp-perturb/guide-assignment)
-Omnibenchmark. Three entrypoints:
+Omnibenchmark. Active public entrypoints and outputs follow the benchmark
+methodology; archived compatibility metrics remain callable but are not wired in
+the plan.
 
 | Entrypoint | Role |
 |---|---|
-| `run.py` (default) | per-lineage metrics: `tier1`, `construct_set`, `kd`, `discovery`, `mismatch`, `strat_tier1`, `strat_mismatch_loc`, `capacity`, `strat_delta_kd` (selected via `--metric`) |
-| `difficulty_run.py` | difficulty table (`--phase table`) and delta-KD validation (`--phase validate`) |
-| `collectors_run.py` | cross-lineage collectors: `jaccard`, `strat_jaccard`, `extraction_shift`, `mismatch` |
+| `run.py` (default) | per-lineage main metrics: `reference_agreement`, `knockdown`, `differential_expression_discovery`, difficulty-stratified counterparts, and `method_resources`; `construct_set_agreement` is supplementary |
+| `collectors_run.py` | supplementary `pairwise_top1_agreement` across assignment configurations |
+| `aggregate_run.py` | writes separate `main_metrics` and `supplementary_metrics` tidy tables (TSV, plus Parquet when available) |
 
 - Env: `assignment_metrics`
