@@ -431,7 +431,7 @@ def main():
     p.add_argument("--output_dir", required=True)
     p.add_argument("--name", default="node")
     p.add_argument("--collector", required=True,
-                   choices=["jaccard", "strat_jaccard", "extraction_shift", "mismatch"])
+                   choices=["jaccard", "pairwise_top1_agreement", "strat_jaccard", "extraction_shift", "mismatch"])
     p.add_argument("--gex", default=None)
     p.add_argument("--gt", default=None)
     p.add_argument("--guide_map", default=None)
@@ -463,7 +463,7 @@ def main():
     guide_map = args.guide_map or getattr(args, "data.guide_map")
     sym_map = getattr(args, "data.gene_symbol_to_ensg")
 
-    if args.collector == "jaccard":
+    if args.collector in ("jaccard", "pairwise_top1_agreement"):
         if len(entries) < 2:
             sys.exit(f"jaccard needs >=2 assignments, got {len(entries)}")
         collect_jaccard(entries, out)

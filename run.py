@@ -105,9 +105,14 @@ def load_guide_mapping(guide_csv):
 # ==========================================================================
 # metric: tier1
 # ==========================================================================
+def _reference_path(args):
+    return (getattr(args, "data.reference_labels", None)
+            or getattr(args, "data.gt_labels", None))
+
+
 def metric_tier1(args, spec, out_json):
     assignments = getattr(args, "guide_assignment.assignments")
-    gt_path = getattr(args, "data.gt_labels")
+    gt_path = _reference_path(args)
     guide_map = getattr(args, "data.guide_map")
     t0 = time.time()
     pgmm = load_assignment_auto(assignments)
@@ -299,14 +304,14 @@ def metric_kd(args, spec, out_json):
         sg2gene, nt = KD.load_guide_map_k562(guide_map)
         X, cell_lookup, gene_list = KD.load_gex_k562(gex, sg2gene, nt)
     else:
-        sg2gene, nt = KD.load_guide_map_papalexi(getattr(args, "data.gt_labels"))
+        sg2gene, nt = KD.load_guide_map_papalexi(_reference_path(args))
         X, cell_lookup, gene_list = KD.load_gex_papalexi(gex)
     pgmm = load_assignment_auto(assignments)
     n_cells = len(pgmm)
     n_rows = sum(len(v) for v in pgmm.values())
     t1 = time.time()
     metrics = KD.compute_kd_metrics(pgmm, X, cell_lookup, gene_list, sg2gene, nt,
-                                    perturbation_type='knockdown', min_cells=5)
+                                    perturbation_type=spec.get("perturbation_type", "knockdown"), min_cells=5)
     if metrics is None:
         sys.exit("kd: no valid guides")
     if spec["guide_design"] == "dual":
@@ -336,7 +341,7 @@ def _load_strata(diff_table):
     rows = list(csv.DictReader(open(diff_table), delimiter='\t'))
     ents = np.array([float(r['entropy_lib']) for r in rows])
     dlts = np.array([float(r['delta']) for r in rows])
-    libs = np.array([float(r['libsize_pctl_in_lane']) for r in rows])
+    libs = np.array([float(r.get('library_size_percentile', r.get('libsize_pctl_in_lane'))) for r in rows])
     ent_t = [float(np.percentile(ents, 33.33)), float(np.percentile(ents, 66.67))]
     dlt_t = [float(np.percentile(dlts, 33.33)), float(np.percentile(dlts, 66.67))]
     n = len(rows)
@@ -353,7 +358,7 @@ def _load_strata(diff_table):
             h[i] = 'gray'
     hard_sets = {st: set() for st in STRATA}
     key_to_idx = {}
-    k80s = np.array([int(r['k80']) for r in rows])
+    k80s = np.zeros(n, dtype=np.int16)
     for i in range(n):
         m = BC_LANE.match(rows[i]['cell_id'])
         k = (int(m.group(2)), m.group(1)) if m else (0, rows[i]['cell_id'])
@@ -452,7 +457,7 @@ def _require_strat_inputs(args, spec):
 def metric_strat_tier1(args, spec, out_json):
     dt = _require_strat_inputs(args, spec)
     assignments = getattr(args, "guide_assignment.assignments")
-    gt_path = getattr(args, "data.gt_labels")
+    gt_path = _reference_path(args)
     guide_csv = getattr(args, "data.guide_map")
     _, _, hard_sets, _, _ = _load_strata(dt)
     sgid_to_c, gt_keys, gt_construct, gt_set_d = _load_gt_construct(gt_path, guide_csv)
@@ -495,11 +500,8 @@ def metric_strat_tier1(args, spec, out_json):
         t1_acc = n_t1 / max(n_assn, 1) if n_assn > 0 else 0
         result[f"{spec['dataset']}__{st}"] = {
             "stratum": st, "n_gt": n_gt, "n_assigned": n_assn,
-            "rec": round(rec, 6), "t1": round(t1_acc, 6), "eff_t1": round(rec * t1_acc, 6),
-            "p_both": round(nb / max(nt, 1), 6), "p_one": round(no / max(nt, 1), 6),
-            "p_zero": round(nz / max(nt, 1), 6),
-            "set_prec": round(sp / max(ne, 1), 6), "set_rec": round(sr / max(ne, 1), 6),
-            "set_f1": round(sf / max(ne, 1), 6)}
+            "assignment_cell_recovery": round(rec, 6),
+            "top1_accuracy": round(t1_acc, 6)}
     _dump(result, out_json)
     print(f"strat_tier1: {len(result)} strata")
 
@@ -900,14 +902,104 @@ def metric_strat_delta_kd(args, spec, out_json):
     for st in STRATA:
         if tgt.get(st):
             a = tgt[st]
-            res["target"][st] = {"n": len(a), "kd_median": round(float(np.median(a)), 4),
-                                 "kd_mean": round(float(np.mean(a)), 4), "kd_std": round(float(np.std(a)), 4)}
+            res["target"][st] = {"n": len(a), "knockdown_median": round(float(np.median(a)), 4),
+                                 "knockdown_mean": round(float(np.mean(a)), 4),
+                                 "fraction_expected_direction": round(float(np.mean(np.asarray(a) < 0)), 4)}
         if ntc.get(st):
             a = ntc[st]
-            res["nt_control"][st] = {"n": len(a), "kd_median": round(float(np.median(a)), 4),
-                                     "kd_mean": round(float(np.mean(a)), 4), "kd_std": round(float(np.std(a)), 4)}
+            res["nt_control"][st] = {"n": len(a), "knockdown_median": round(float(np.median(a)), 4),
+                                     "knockdown_mean": round(float(np.mean(a)), 4),
+                                     "fraction_expected_direction": round(float(np.mean(np.abs(np.asarray(a)) < 0.01)), 4)}
     _dump(res, out_json)
     print(f"strat_delta_kd: {len(res['target'])} target strata")
+
+
+# --------------------------------------------------------------------------
+# Public methodology-facing metric names.  Legacy functions above are retained
+# solely to reproduce archived calculations; active plans dispatch only here.
+# --------------------------------------------------------------------------
+def metric_reference_agreement(args, spec, out_json):
+    metric_tier1(args, spec, out_json)
+    result = json.load(open(out_json))
+    pgmm = load_assignment_auto(getattr(args, "guide_assignment.assignments"))
+    gpc = [len(v) for v in pgmm.values()]
+    histogram = dict(sorted(Counter(gpc).items()))
+    public = {
+        "metric": "reference_agreement", "dataset": spec["dataset"],
+        "assignment_cell_recovery": result.get("cell_recovery_rate"),
+        "top1_accuracy": result.get("t1_pair_accuracy"),
+        "ari": result.get("ari"),
+        "per_construct_pearson": result.get("per_construct_pearson_r"),
+        "n_reference_cells": result.get("n_shared_cells"),
+        "assigned_cells": result.get("cells_assigned"),
+        "total_assignments": result.get("total_assignments", sum(gpc)),
+        "guides_per_cell_median": result.get("guides_per_cell_median"),
+        "guides_per_cell_mean": result.get("guides_per_cell_mean"),
+        "guides_per_cell_distribution": histogram,
+    }
+    _dump(public, out_json)
+
+
+def metric_knockdown(args, spec, out_json):
+    if not spec.get("knockdown_applicable", True):
+        _dump({"metric": "knockdown", "dataset": spec["dataset"],
+               "skipped": "not applicable to this dataset"}, out_json)
+        return
+    metric_kd(args, spec, out_json)
+    result = json.load(open(out_json))
+    public = {"metric": "knockdown", "dataset": spec["dataset"],
+              "knockdown_mean": result.get("kd_efficiency_mean"),
+              "knockdown_median": result.get("kd_efficiency_median"),
+              "fraction_expected_direction": result.get("fraction_expected_direction"),
+              "n_guides_tested": result.get("n_guides_tested"),
+              # Supplementary diagnostics explicitly retained by methodology.
+              "nt_nt_behavior": result.get("nt_nt_baseline"),
+              "dual_guide_pair_consistency": result.get("pair_consistency")}
+    _dump(public, out_json)
+
+
+def metric_differential_expression_discovery(args, spec, out_json):
+    metric_discovery(args, spec, out_json)
+    result = json.load(open(out_json))
+    n = result.get("n_cells_assigned", 0) or 0
+    result["metric"] = "differential_expression_discovery"
+    result["discoveries_per_1000_assigned_cells"] = round(1000 * result.get("discovery_total", 0) / n, 6) if n else 0.0
+    # FPR remains available as supplementary reporting; median discovery and
+    # evaluator wall time are deliberately not part of the public contract.
+    result.pop("discovery_median", None)
+    result.pop("wall_s", None)
+    _dump(result, out_json)
+
+
+def metric_stratified_reference_agreement(args, spec, out_json):
+    metric_strat_tier1(args, spec, out_json)
+    result = json.load(open(out_json))
+    _dump({"metric": "stratified_reference_agreement", "dataset": spec["dataset"],
+           "strata": result}, out_json)
+
+
+def metric_stratified_knockdown(args, spec, out_json):
+    metric_strat_delta_kd(args, spec, out_json)
+    result = json.load(open(out_json))
+    result["metric"] = "stratified_knockdown"
+    _dump(result, out_json)
+
+
+def metric_construct_set_agreement(args, spec, out_json):
+    metric_construct_set(args, spec, out_json)
+    result = json.load(open(out_json))
+    result["metric"] = "construct_set_agreement"
+    result.pop("wall_s", None)
+    _dump(result, out_json)
+
+
+def metric_method_resources(args, spec, out_json):
+    path = getattr(args, "guide_assignment.monitoring", None)
+    if not path:
+        sys.exit("method_resources requires --guide_assignment.monitoring")
+    result = json.load(open(path))
+    result.update({"metric": "method_resources", "dataset": spec["dataset"]})
+    _dump(result, out_json)
 
 
 def _pending(name):
@@ -922,6 +1014,13 @@ def _dump(obj, path):
 
 
 DISPATCH = {
+    "reference_agreement": metric_reference_agreement,
+    "knockdown": metric_knockdown,
+    "differential_expression_discovery": metric_differential_expression_discovery,
+    "stratified_reference_agreement": metric_stratified_reference_agreement,
+    "stratified_knockdown": metric_stratified_knockdown,
+    "construct_set_agreement": metric_construct_set_agreement,
+    "method_resources": metric_method_resources,
     "tier1": metric_tier1,
     "construct_set": metric_construct_set,
     "kd": metric_kd,
@@ -939,12 +1038,14 @@ def main():
     p.add_argument("--output_dir", required=True)
     p.add_argument("--name", default="node")
     p.add_argument("--guide_assignment.assignments", required=True)
-    p.add_argument("--data.gt_labels", required=True)
+    p.add_argument("--data.reference_labels", default=None)
+    p.add_argument("--data.gt_labels", default=None, help="Deprecated compatibility alias")
     p.add_argument("--data.guide_map", required=True)
     p.add_argument("--data.spec", required=True)
     p.add_argument("--data.gex", default=None)
     p.add_argument("--data.difficulty_table", default=None)
     p.add_argument("--data.gene_symbol_to_ensg", default=None)
+    p.add_argument("--guide_assignment.monitoring", default=None)
     p.add_argument("--metric", required=True)
     args = p.parse_args()
 

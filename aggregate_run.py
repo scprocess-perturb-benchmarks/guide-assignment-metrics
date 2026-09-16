@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate collector: flatten every per-lineage metric JSON into one tidy table.
+"""Aggregate assignment metric JSONs into main and supplementary tidy tables.
 
 Fans in the score JSONs from all metric stages (metrics_gt / metrics_gex /
 metrics_discovery) — plus any collector JSONs passed — and writes a single
@@ -7,9 +7,7 @@ long-format table (one row per scalar value), matching the omni-perturb style:
 
     columns: dataset, method, metric, submetric, value
 
-Output: metrics.tsv (always) + metrics.parquet (if pyarrow is available).
-Running the full plan therefore yields the individual JSONs AND one aggregated
-data file that contains all three metric layers together.
+Outputs: main_metrics.tsv/.parquet and supplementary_metrics.tsv/.parquet.
 """
 import argparse
 import csv
@@ -73,25 +71,39 @@ def _flatten(obj, prefix=""):
                             yield f"{name}.{sk}.{ssk}", ssv
 
 
+def _tier(metric, submetric):
+    """Methodology-defined reporting tier, not a scientific calculation."""
+    if metric in {"construct_set_agreement"}:
+        return "supplementary"
+    if metric == "knockdown" and submetric.startswith(("nt_nt_behavior", "dual_guide_pair_consistency")):
+        return "supplementary"
+    if metric == "differential_expression_discovery" and submetric in {
+            "fpr", "total_false_discoveries", "total_tests", "n_nt_cells", "n_nt_guides_tested"}:
+        return "supplementary"
+    return "main"
+
+
 def main():
     p = argparse.ArgumentParser(description="Aggregate per-lineage metric JSONs into one tidy table")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--name", default="metrics")
     # OB injects one flag per fan-in input id; accept any *.scores plus generic tokens.
-    for flag in ("metrics_gt.scores", "metrics_gex.scores", "metrics_discovery.scores", "scores"):
+    for flag in ("metrics_reference.scores", "metrics_gex.scores", "metrics_discovery.scores",
+                 "metrics_resources.scores", "metrics_supplementary.scores", "scores"):
         p.add_argument(f"--{flag}", action="append", default=[])
     p.add_argument("--scores_dir", action="append", default=[])
     args, extra = p.parse_known_args()
 
     files = []
-    for flag in ("metrics_gt.scores", "metrics_gex.scores", "metrics_discovery.scores", "scores"):
+    for flag in ("metrics_reference.scores", "metrics_gex.scores", "metrics_discovery.scores",
+                 "metrics_resources.scores", "metrics_supplementary.scores", "scores"):
         files += list(getattr(args, flag.replace(".", "_")) if hasattr(args, flag.replace(".", "_")) else getattr(args, flag))
     for d in args.scores_dir:
         files += glob.glob(os.path.join(d, "**", "*.scores.json"), recursive=True)
     files += [t for t in extra if t.endswith(".scores.json")]
     files = sorted(set(files))
 
-    rows = []
+    main_rows, supplementary_rows = [], []
     for f in files:
         try:
             d = json.load(open(f))
@@ -101,24 +113,27 @@ def main():
         dataset = d.get("dataset") or _dataset_of(f)
         method = _method_of(f)
         for sub, val in _flatten(d):
-            rows.append({"dataset": dataset, "method": method, "metric": metric,
-                         "submetric": sub, "value": val})
+            row = {"dataset": dataset, "method": method, "metric": metric,
+                   "submetric": sub, "value": val}
+            (main_rows if _tier(metric, sub) == "main" else supplementary_rows).append(row)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    tsv = os.path.join(args.output_dir, "metrics.tsv")
     cols = ["dataset", "method", "metric", "submetric", "value"]
-    with open(tsv, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols, delimiter="\t")
-        w.writeheader()
-        w.writerows(rows)
+    for label, rows in (("main", main_rows), ("supplementary", supplementary_rows)):
+        with open(os.path.join(args.output_dir, f"{label}_metrics.tsv"), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols, delimiter="\t")
+            w.writeheader()
+            w.writerows(rows)
     try:
         import pandas as pd
-        pd.DataFrame(rows, columns=cols).to_parquet(
-            os.path.join(args.output_dir, "metrics.parquet"), index=False)
-        pq = " + metrics.parquet"
+        for label, rows in (("main", main_rows), ("supplementary", supplementary_rows)):
+            pd.DataFrame(rows, columns=cols).to_parquet(
+                os.path.join(args.output_dir, f"{label}_metrics.parquet"), index=False)
+        pq = " + parquet files"
     except Exception:
         pq = " (parquet skipped: pyarrow not available)"
-    print(f"aggregate: {len(rows)} rows from {len(files)} metric files -> metrics.tsv{pq}")
+    print(f"aggregate: {len(main_rows)} main + {len(supplementary_rows)} supplementary rows "
+          f"from {len(files)} metric files{pq}")
 
 
 if __name__ == "__main__":
