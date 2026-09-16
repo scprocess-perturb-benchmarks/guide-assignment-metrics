@@ -39,6 +39,7 @@ import benchmark_kd_efficiency as KD        # noqa: E402  (KD loaders + compute_
 BC_STD = re.compile(r'^([ACGT]{16})-(\d+)$')       # Replogle GT: 16mer-gem_group
 BC_LANE = re.compile(r'^([ACGT]{16})-L(\d+)$')     # assignment:  16mer-LNN
 BC_GT_P = re.compile(r'^l(\d+)_([ACGT]{16})$')     # Papalexi GT: l{N}_16mer
+BC_NORMAN = re.compile(r'^([ACGT]{16})-(\d+)$')   # Norman: 16mer-gemgroup
 
 
 def load_spec(path):
@@ -110,6 +111,60 @@ def _reference_path(args):
             or getattr(args, "data.gt_labels", None))
 
 
+def _load_norman_assignments(path):
+    """Norman construct-level assignments, preserving each runner's ranking rule."""
+    with open(path) as fh:
+        fields = set(next(csv.reader(fh)))
+    score, ascending = ("log_pval", True) if "log_pval" in fields else ("percent_counts", False) if "percent_counts" in fields else ("UMI_counts", False)
+    out = defaultdict(list)
+    for row in csv.DictReader(open(path)):
+        m = BC_NORMAN.match((row.get("cell") or "").strip())
+        guide = (row.get("gRNA") or "").strip()
+        if not m or not guide:
+            continue
+        value = float(row.get(score, 0) or 0)
+        out[(int(m.group(2)), m.group(1))].append((guide, value))
+    for values in out.values():
+        values.sort(key=lambda x: x[1], reverse=not ascending)
+    return dict(out)
+
+
+def _load_norman_reference(path):
+    import gzip
+    reference = {}
+    with gzip.open(path, "rt") as fh:
+        for row in csv.DictReader(fh):
+            m = BC_NORMAN.match((row.get("cell_barcode") or "").strip())
+            label = (row.get("guide_identity") or "").strip()
+            if m and label:
+                reference[(int(m.group(2)), m.group(1))] = label.split("__")[0]
+    return reference
+
+
+def _norman_reference_metrics(args, spec):
+    from sklearn.metrics import adjusted_rand_score
+    pg = _load_norman_assignments(getattr(args, "guide_assignment.assignments"))
+    ref = _load_norman_reference(_reference_path(args))
+    shared = sorted(set(pg) & set(ref))
+    pred = [pg[k][0][0] for k in shared if pg[k]]
+    shared = [k for k in shared if pg[k]]
+    correct = sum(p == ref[k] for k, p in zip(shared, pred))
+    labels = set(ref[k] for k in shared) | set(pred)
+    x = [sum(ref[k] == label for k in shared) for label in labels]
+    y = [sum(p == label for p in pred) for label in labels]
+    r = float(np.corrcoef(x, y)[0, 1]) if len(labels) > 2 else 0.0
+    gpc = [len(v) for v in pg.values()]
+    return {"metric": "reference_agreement", "dataset": spec["dataset"],
+            "assignment_cell_recovery": round(len(shared) / max(len(ref), 1), 6),
+            "top1_accuracy": round(correct / max(len(shared), 1), 6),
+            "ari": round(float(adjusted_rand_score([ref[k] for k in shared], pred)), 6) if len(shared) > 1 else 0.0,
+            "per_construct_pearson": round(r, 6), "n_reference_cells": len(ref),
+            "n_shared_cells": len(shared), "assigned_cells": len(pg),
+            "total_assignments": sum(gpc), "guides_per_cell_median": float(np.median(gpc)) if gpc else 0.0,
+            "guides_per_cell_mean": float(np.mean(gpc)) if gpc else 0.0,
+            "guides_per_cell_distribution": dict(sorted(Counter(gpc).items()))}
+
+
 def metric_tier1(args, spec, out_json):
     assignments = getattr(args, "guide_assignment.assignments")
     gt_path = _reference_path(args)
@@ -163,6 +218,7 @@ def _tier1_single(pgmm, gt_csv, spec):
     r = float(np.corrcoef(x, y)[0, 1]) if len(x) > 2 else 0.0
     gpc = [len(v) for v in pgmm.values()]
     return {"metric": "tier1", "dataset": spec["dataset"], "guide_design": "single",
+            "n_reference_cells": n_gt,
             "cell_recovery_rate": round(n_shared / max(n_gt, 1), 6),
             "t1_pair_accuracy": round(n_t1 / max(n_shared, 1), 6),
             "effective_t1": round(n_t1 / max(n_gt, 1), 6),
@@ -918,7 +974,98 @@ def metric_strat_delta_kd(args, spec, out_json):
 # Public methodology-facing metric names.  Legacy functions above are retained
 # solely to reproduce archived calculations; active plans dispatch only here.
 # --------------------------------------------------------------------------
+def _norman_gex(args):
+    """Load published Norman count MEX exactly as the archived benchmark did."""
+    import gzip
+    import scipy.io
+    manifest_path = getattr(args, "data.gex_manifest", None)
+    if not manifest_path:
+        sys.exit("Norman metrics require --data.gex_manifest")
+    manifest = json.load(open(manifest_path))
+    required = ("matrix", "barcodes", "features")
+    if not all(manifest.get(k) for k in required):
+        sys.exit("Norman metrics require published GEX matrix, barcodes, and features")
+    with gzip.open(manifest["matrix"], "rt") as fh:
+        X = scipy.io.mmread(fh).tocsr().T.tocsr()  # published MEX is genes x cells
+    with gzip.open(manifest["barcodes"], "rt") as fh:
+        barcodes = [x.strip() for x in fh]
+    with gzip.open(manifest["features"], "rt") as fh:
+        genes = [x.rstrip("\n").split("\t")[1] for x in fh]
+    lookup = {}
+    for i, bc in enumerate(barcodes):
+        m = BC_NORMAN.match(bc)
+        if m:
+            lookup[(int(m.group(2)), m.group(1))] = i
+    return X, lookup, genes
+
+
+def _norman_targets(construct):
+    return [x for x in construct.split("_") if x and not x.startswith("NegCtrl")]
+
+
+def _norman_activation_metrics(args, spec):
+    X, lookup, genes = _norman_gex(args)
+    g2i = {g: i for i, g in enumerate(genes)}
+    pg = _load_norman_assignments(getattr(args, "guide_assignment.assignments"))
+    top1 = {k: v[0][0] for k, v in pg.items() if v}
+    nt = sorted({lookup[k] for k, c in top1.items() if not _norman_targets(c) and k in lookup})
+    values = []
+    for construct in sorted(set(top1.values())):
+        cells = [lookup[k] for k, c in top1.items() if c == construct and k in lookup]
+        if len(cells) < 5:
+            continue
+        for gene in _norman_targets(construct):
+            gi = g2i.get(gene)
+            if gi is None or len(nt) < 5:
+                continue
+            col = X[:, gi].toarray().ravel()
+            eps = max(float(col.mean()) * 0.01, 1e-6)
+            values.append(float(np.log2(max(col[cells].mean() + eps, eps)) - np.log2(max(col[nt].mean() + eps, eps))))
+    return {"metric": "knockdown", "dataset": spec["dataset"], "perturbation_type": "activation",
+            "knockdown_mean": round(float(np.mean(values)), 4) if values else 0.0,
+            "knockdown_median": round(float(np.median(values)), 4) if values else 0.0,
+            "fraction_expected_direction": round(float(np.mean(np.asarray(values) > 0)), 4) if values else 0.0,
+            "n_guides_tested": len(values), "n_nt_cells": len(nt)}
+
+
+def _norman_discovery_metrics(args, spec):
+    from scipy.stats import mannwhitneyu
+    from statsmodels.stats.multitest import multipletests
+    X, lookup, _ = _norman_gex(args)
+    sample = np.sort(np.random.RandomState(42).choice(X.shape[0], min(30000, X.shape[0]), replace=False))
+    xs = X[sample, :]
+    variance = np.asarray(xs.power(2).mean(axis=0)).ravel() - np.asarray(xs.mean(axis=0)).ravel() ** 2
+    top = np.sort(np.argsort(variance)[-5000:])
+    hvg = X[:, top].toarray().astype(np.float32)
+    pg = _load_norman_assignments(getattr(args, "guide_assignment.assignments"))
+    top1 = {k: v[0][0] for k, v in pg.items() if v}
+    nt = sorted({lookup[k] for k, c in top1.items() if not _norman_targets(c) and k in lookup})
+    def count(cells):
+        if len(cells) < 5 or len(nt) < 5: return 0
+        p = [mannwhitneyu(hvg[cells, i], hvg[nt, i], alternative="two-sided").pvalue for i in range(hvg.shape[1])]
+        return int((multipletests(p, method="fdr_bh")[1] < 0.05).sum())
+    groups = defaultdict(set)
+    for k, c in top1.items():
+        if _norman_targets(c) and k in lookup: groups[c].add(lookup[k])
+    discoveries = [count(sorted(c)) for c in groups.values() if len(c) >= 10]
+    nt_groups = defaultdict(set)
+    for k, c in top1.items():
+        if not _norman_targets(c) and k in lookup: nt_groups[c].add(lookup[k])
+    fp = [count(sorted(c)) for c in nt_groups.values() if len(c) >= 5]
+    denom = len(fp) * len(top)
+    return {"metric": "differential_expression_discovery", "dataset": spec["dataset"],
+            "discovery_total": int(np.sum(discoveries)), "discoveries_per_1000_assigned_cells": round(1000 * np.sum(discoveries) / max(len(pg), 1), 6),
+            "n_constructs_tested": len(discoveries), "n_cells_assigned": len(pg),
+            "n_nt_cells": len(nt), "n_nt_constructs_tested": len(fp),
+            "total_false_discoveries": int(np.sum(fp)), "total_tests": denom,
+            "fpr": float(np.sum(fp) / denom) if denom else 0.0,
+            "hvg_selection": "top_5000_variance_from_seed42_sample_of_30000_cells"}
+
+
 def metric_reference_agreement(args, spec, out_json):
+    if spec.get("reference_schema") == "norman_construct":
+        _dump(_norman_reference_metrics(args, spec), out_json)
+        return
     metric_tier1(args, spec, out_json)
     result = json.load(open(out_json))
     pgmm = load_assignment_auto(getattr(args, "guide_assignment.assignments"))
@@ -930,7 +1077,8 @@ def metric_reference_agreement(args, spec, out_json):
         "top1_accuracy": result.get("t1_pair_accuracy"),
         "ari": result.get("ari"),
         "per_construct_pearson": result.get("per_construct_pearson_r"),
-        "n_reference_cells": result.get("n_shared_cells"),
+        "n_reference_cells": result.get("n_reference_cells"),
+        "n_shared_cells": result.get("n_shared_cells"),
         "assigned_cells": result.get("cells_assigned"),
         "total_assignments": result.get("total_assignments", sum(gpc)),
         "guides_per_cell_median": result.get("guides_per_cell_median"),
@@ -944,6 +1092,9 @@ def metric_knockdown(args, spec, out_json):
     if not spec.get("knockdown_applicable", True):
         _dump({"metric": "knockdown", "dataset": spec["dataset"],
                "skipped": "not applicable to this dataset"}, out_json)
+        return
+    if spec.get("reference_schema") == "norman_construct":
+        _dump(_norman_activation_metrics(args, spec), out_json)
         return
     metric_kd(args, spec, out_json)
     result = json.load(open(out_json))
@@ -959,6 +1110,13 @@ def metric_knockdown(args, spec, out_json):
 
 
 def metric_differential_expression_discovery(args, spec, out_json):
+    if not spec.get("knockdown_applicable", True):
+        _dump({"metric": "differential_expression_discovery", "dataset": spec["dataset"],
+               "skipped": "not applicable to this dataset"}, out_json)
+        return
+    if spec.get("reference_schema") == "norman_construct":
+        _dump(_norman_discovery_metrics(args, spec), out_json)
+        return
     metric_discovery(args, spec, out_json)
     result = json.load(open(out_json))
     n = result.get("n_cells_assigned", 0) or 0
@@ -972,6 +1130,24 @@ def metric_differential_expression_discovery(args, spec, out_json):
 
 
 def metric_stratified_reference_agreement(args, spec, out_json):
+    if spec.get("reference_schema") == "papalexi_single":
+        _dump({"metric": "stratified_reference_agreement", "dataset": spec["dataset"],
+               "skipped": "difficulty strata are not part of the Papalexi supplementary protocol"}, out_json)
+        return
+    if spec.get("reference_schema") == "norman_construct":
+        rows = list(csv.DictReader(open(getattr(args, "data.difficulty_table")), delimiter="\t"))
+        strata = {r["cell_id"]: r["difficulty_stratum"] for r in rows}
+        pg = _load_norman_assignments(getattr(args, "guide_assignment.assignments"))
+        ref = _load_norman_reference(_reference_path(args))
+        payload = {}
+        for st in STRATA:
+            keys = [k for k in ref if f"{k[1]}-{k[0]}" in strata and strata[f"{k[1]}-{k[0]}"] == st]
+            assigned = [k for k in keys if k in pg and pg[k]]
+            payload[st] = {"n_reference_cells": len(keys), "n_assigned": len(assigned),
+                           "assignment_cell_recovery": round(len(assigned) / max(len(keys), 1), 6),
+                           "top1_accuracy": round(sum(pg[k][0][0] == ref[k] for k in assigned) / max(len(assigned), 1), 6)}
+        _dump({"metric": "stratified_reference_agreement", "dataset": spec["dataset"], "strata": payload}, out_json)
+        return
     metric_strat_tier1(args, spec, out_json)
     result = json.load(open(out_json))
     _dump({"metric": "stratified_reference_agreement", "dataset": spec["dataset"],
@@ -979,6 +1155,14 @@ def metric_stratified_reference_agreement(args, spec, out_json):
 
 
 def metric_stratified_knockdown(args, spec, out_json):
+    if not spec.get("knockdown_applicable", True):
+        _dump({"metric": "stratified_knockdown", "dataset": spec["dataset"],
+               "skipped": "not applicable to this dataset"}, out_json)
+        return
+    if spec.get("reference_schema") == "norman_construct":
+        _dump({"metric": "stratified_knockdown", "dataset": spec["dataset"],
+               "skipped": "Norman activation strata will be emitted by the published-count adapter"}, out_json)
+        return
     metric_strat_delta_kd(args, spec, out_json)
     result = json.load(open(out_json))
     result["metric"] = "stratified_knockdown"
@@ -1045,6 +1229,7 @@ def main():
     p.add_argument("--data.gex", default=None)
     p.add_argument("--data.difficulty_table", default=None)
     p.add_argument("--data.gene_symbol_to_ensg", default=None)
+    p.add_argument("--data.gex_manifest", default=None)
     p.add_argument("--guide_assignment.monitoring", default=None)
     p.add_argument("--metric", required=True)
     args = p.parse_args()
