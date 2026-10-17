@@ -1,6 +1,6 @@
 # guide-assignment-metrics
 
-Evaluation module for the [guide-assignment](https://github.com/tmp-perturb/guide-assignment)
+Evaluation module for the [guide-assignment](https://github.com/scprocess-perturb-benchmarks/guide-assignment)
 Omnibenchmark. Active public entrypoints and outputs follow the benchmark
 methodology; archived compatibility metrics remain callable but are not wired in
 the plan.
